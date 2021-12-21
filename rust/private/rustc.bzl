@@ -656,6 +656,7 @@ def construct_arguments(
                 - all (list): A list of all `Args` objects in the order listed above.
                     This is to be passed to the `arguments` parameter of actions
             - (dict): Common rustc environment variables
+            - (list): Extra input files for the compile action
     """
     output_dir = getattr(crate_info.output, "dirname", None)
     linker_script = getattr(file, "linker_script", None)
@@ -797,7 +798,7 @@ def construct_arguments(
         _add_native_link_flags(rustc_flags, dep_info, linkstamp_outs, ambiguous_libs, crate_info.type, toolchain, cc_toolchain, feature_configuration)
 
     # These always need to be added, even if not linking this crate.
-    add_crate_link_flags(rustc_flags, dep_info, force_all_deps_direct)
+    extra_link_inputs = add_crate_link_flags(ctx, toolchain, rustc_flags, crate_info, dep_info, force_all_deps_direct)
 
     needs_extern_proc_macro_flag = "proc-macro" in [crate_info.type, crate_info.wrapped_crate_type] and \
                                    crate_info.edition != "2015"
@@ -846,7 +847,7 @@ def construct_arguments(
         all = [process_wrapper_flags, rustc_path, rustc_flags],
     )
 
-    return args, env
+    return args, env, extra_link_inputs
 
 def rustc_compile_action(
         ctx,
@@ -903,7 +904,7 @@ def rustc_compile_action(
         stamp = stamp,
     )
 
-    args, env_from_args = construct_arguments(
+    args, env_from_args, extra_link_inputs = construct_arguments(
         ctx = ctx,
         attr = attr,
         file = ctx.file,
@@ -923,6 +924,7 @@ def rustc_compile_action(
         force_all_deps_direct = force_all_deps_direct,
         stamp = stamp,
     )
+    compile_inputs = depset(extra_link_inputs, transitive = [compile_inputs])
 
     env = dict(ctx.configuration.default_shell_env)
     env.update(env_from_args)
@@ -1249,16 +1251,71 @@ def _get_dir_names(files):
         dirs[f.dirname] = None
     return dirs.keys()
 
-def add_crate_link_flags(args, dep_info, force_all_deps_direct = False):
+def _symlink_transitive_crates_if_needed(ctx, toolchain, crate_info, dep_info):
+    """Collect and symlink the transitive crates into a single directory.
+
+    The reason for this is that when passing a large (350+) number of `-Ldependency=` arguments to rustc on
+    Windows, we seem to be getting some obscure errors such as "failure to call `LoadLibraryExW` that results
+    on some transitive dependencies not being picked up and the build to fail.
+
+    If we detect a large number of transitive dependencies we symlink them all into a single directory that
+    we can pass to rustc in a single `-Ldependency=` argument.
+
+    Args:
+        ctx (ctx): The rule's context object
+        toolchain (rust_toolchain): The current `rust_toolchain`
+        crate_info (CrateInfo): The CrateInfo provider of the target crate
+        dep_info (DepInfo): The current target's dependency info
+
+    Returns:
+        tuple: A tuple of the following items
+            - (File): Optional - the output directory containing all transitive crates that this crate depends on.
+            - (list): The list of transitive crates files that should be used as input to the build action.
+    """
+    if toolchain.os != "windows":
+        return None, []
+
+    deps = dep_info.transitive_crates.to_list()
+
+    # Only symlink if we are about to pass a large (350+) number of transitive dependencies to rustc.
+    if not deps or len(deps) < 350:
+        return None, []
+
+    output_dirname = crate_info.output.basename + ".transitive_crates"
+    links = []
+
+    # Keep a list of the crates that were currently added so that we can uniquify them.
+    names = {}
+
+    for dep in deps:
+        name = dep.output.basename
+        if name in names:
+            continue
+
+        link = ctx.actions.declare_file(output_dirname + "/" + name)
+        ctx.actions.symlink(output = link, target_file = dep.output, is_executable = True)
+
+        names[name] = True
+        links.append(link)
+
+    return links[0].dirname, links
+
+def add_crate_link_flags(ctx, toolchain, args, crate_info, dep_info, force_all_deps_direct = False):
     """Adds link flags to an Args object reference
 
     Args:
+        ctx (ctx): The rule's context object
+        toolchain (rust_toolchain): The current `rust_toolchain`
         args (Args): An arguments object reference
+        crate_info (CrateInfo): The CrateInfo provider for the current target.
         dep_info (DepInfo): The current target's dependency info
+            If this argument is set, only it will be added as a `-Ldependency=` flag, otherwise all rlibs will be set individually.
         force_all_deps_direct (bool, optional): Whether to pass the transitive rlibs with --extern
             to the commandline as opposed to -L.
-    """
 
+    Returns:
+        - (list): A list of extra inputs that should be added to the rustc compile action.
+    """
     if force_all_deps_direct:
         args.add_all(
             depset(
@@ -1273,12 +1330,21 @@ def add_crate_link_flags(args, dep_info, force_all_deps_direct = False):
     else:
         # nb. Direct crates are linked via --extern regardless of their crate_type
         args.add_all(dep_info.direct_crates, map_each = _crate_to_link_flag)
-    args.add_all(
-        dep_info.transitive_crates,
-        map_each = _get_crate_dirname,
-        uniquify = True,
-        format_each = "-Ldependency=%s",
-    )
+
+    transitive_crates_dir, transitive_crates_links = _symlink_transitive_crates_if_needed(ctx, toolchain, crate_info, dep_info)
+
+    # If transitive rlibs have been collected into this single directory, only set this directory
+    if transitive_crates_dir:
+        args.add("-Ldependency={}".format(transitive_crates_dir))
+    else:
+        args.add_all(
+            dep_info.transitive_crates,
+            map_each = _get_crate_dirname,
+            uniquify = True,
+            format_each = "-Ldependency=%s",
+        )
+
+    return transitive_crates_links
 
 def _crate_to_link_flag(crate):
     """A helper macro used by `add_crate_link_flags` for adding crate link flags to a Arg object

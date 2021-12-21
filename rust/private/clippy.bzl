@@ -106,7 +106,7 @@ def _clippy_aspect_impl(target, ctx):
         build_info,
     )
 
-    args, env = construct_arguments(
+    args, env, extra_link_inputs = construct_arguments(
         ctx = ctx,
         attr = ctx.rule.attr,
         file = ctx.file,
@@ -125,6 +125,7 @@ def _clippy_aspect_impl(target, ctx):
         build_flags_files = build_flags_files,
         emit = ["dep-info", "metadata"],
     )
+    compile_inputs = depset(extra_link_inputs, transitive = [compile_inputs])
 
     if crate_info.is_test:
         args.rustc_flags.add("--test")
